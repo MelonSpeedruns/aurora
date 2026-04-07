@@ -84,6 +84,11 @@ void new_frame(const AuroraWindowSize& size) noexcept {
       }
       g_scale = size.scale;
     }
+    // Font atlas may have been cleared externally (e.g. ImGuiEngine_Initialize on resolution change).
+    // Force device object recreation so the font texture is rebuilt before ImGui::NewFrame().
+    if (!ImGui::GetIO().Fonts->IsBuilt()) {
+      ImGui_ImplWGPU_CreateDeviceObjects();
+    }
     ImGui_ImplWGPU_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
