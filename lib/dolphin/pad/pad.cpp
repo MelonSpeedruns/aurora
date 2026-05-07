@@ -2,6 +2,7 @@
 #include "../../internal.hpp"
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
+#include <SDL3/SDL_mouse.h>
 
 #include <array>
 #include <sys/stat.h>
@@ -115,19 +116,35 @@ constexpr PADCLampRegion ClampRegion{
 };
 
 bool g_initialized;
+bool g_keyboardBindingsLoaded = false;
 bool g_blockPAD = false;
 bool g_suppressHeldOnRead = false;
 std::array<PADButton, PAD_CHANMAX> g_suppressedButtons{};
 std::array<bool, PAD_CHANMAX> g_suppressLeftTrigger{};
 std::array<bool, PAD_CHANMAX> g_suppressRightTrigger{};
+
+bool is_mouse_scancode(s32 scancode) { return scancode < PAD_KEY_INVALID; }
+bool is_mouse_button_pressed(s32 scancode) {
+  const int32_t buttonNum = -(scancode + 1);
+  if (buttonNum < 1 || buttonNum > 5) {
+    return false;
+  }
+  float x, y;
+  const auto buttons = SDL_GetMouseState(&x, &y);
+  return (buttons & (1u << (buttonNum - 1))) != 0u;
+}
 } // namespace
 
 void PADSetSpec(u32 spec) {}
+
+static void load_keyboard_bindings();
+static void save_keyboard_bindings();
 
 BOOL PADInit() {
   if (g_initialized) {
     return true;
   }
+  g_initialized = true;
 
   std::for_each(g_keyboardBindings.begin(), g_keyboardBindings.end(), [](auto& state) {
     state.m_buttonMapping = g_defaultKeys;
@@ -174,14 +191,20 @@ const char* PADGetNameForControllerIndex(uint32_t idx) {
 
 void PADSetPortForIndex(uint32_t idx, int32_t port) {
   auto* ctrl = __PADGetControllerForIndex(idx);
-  auto* dest = aurora::input::get_controller_for_player(port);
   if (ctrl == nullptr) {
     return;
   }
-  if (dest != nullptr) {
+
+  const int32_t oldPort = SDL_GetGamepadPlayerIndex(ctrl->m_controller);
+  auto* dest = aurora::input::get_controller_for_player(port);
+  if (dest != nullptr && dest != ctrl) {
     SDL_SetGamepadPlayerIndex(dest->m_controller, -1);
   }
+  if (oldPort >= 0 && oldPort != port) {
+    aurora::input::persist_controller_for_player(oldPort, nullptr);
+  }
   SDL_SetGamepadPlayerIndex(ctrl->m_controller, port);
+  aurora::input::persist_controller_for_player(port, ctrl);
 }
 
 int32_t PADGetIndexForPort(uint32_t port) {
@@ -201,6 +224,7 @@ int32_t PADGetIndexForPort(uint32_t port) {
 }
 
 void PADClearPort(uint32_t port) {
+  aurora::input::persist_controller_for_player(port, nullptr);
   auto* ctrl = aurora::input::get_controller_for_player(port);
   if (ctrl == nullptr) {
     return;
@@ -224,20 +248,20 @@ void __PADLoadMapping(aurora::input::GameController* controller) {
 
   auto path = fmt::format("{}/{}_{:04X}_{:04X}.controller", basePath, PADGetName(playerIndex), controller->m_vid,
                           controller->m_pid);
-  FILE* file = fopen(path.c_str(), "rb");
+  SDL_IOStream* file = SDL_IOFromFile(path.c_str(), "rb");
   if (file == nullptr) {
     return;
   }
 
   uint32_t magic = 0;
-  fread(&magic, 1, sizeof(uint32_t), file);
+  SDL_ReadU32LE(file, &magic);
   if (magic != SBIG('CTRL')) {
     aurora::input::Log.warn("Invalid controller mapping magic!");
     return;
   }
 
   uint32_t version = 0;
-  fread(&version, 1, sizeof(uint32_t), file);
+  SDL_ReadU32LE(file, &version);
   if (version != k_mappingsFileVersion) {
     aurora::input::Log.warn("Invalid controller mapping version! (Expected {0}, found {1})", k_mappingsFileVersion,
                             version);
@@ -245,24 +269,51 @@ void __PADLoadMapping(aurora::input::GameController* controller) {
   }
 
   bool isGameCube = false;
-  fread(&isGameCube, 1, 1, file);
-  fseek(file, (ftell(file) + 31) & ~31, SEEK_SET);
-  uint32_t dataStart = ftell(file);
+  SDL_ReadIO( file, &isGameCube, sizeof(bool));
+  SDL_SeekIO(file, (SDL_TellIO(file) + 31) & ~31, SDL_IO_SEEK_SET);
+  uint32_t dataStart = SDL_TellIO(file);
   if (isGameCube) {
     uint32_t dzSecLen = sizeof(PADDeadZones);
     uint32_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
     uint32_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
-    fseek(file, dataStart + ((dzSecLen + btnSecLen + axisSecLen) * playerIndex), SEEK_SET);
+    SDL_SeekIO(file, dataStart + ((dzSecLen + btnSecLen + axisSecLen) * playerIndex), SDL_IO_SEEK_SET);
   }
 
-  fread(&controller->m_deadZones, 1, sizeof(PADDeadZones), file);
-  fread(&controller->m_buttonMapping, 1, sizeof(PADButtonMapping) * PAD_BUTTON_COUNT, file);
-  fread(&controller->m_axisMapping, 1, sizeof(PADAxisMapping) * PAD_AXIS_COUNT, file);
+  SDL_ReadIO(file, &controller->m_deadZones, sizeof(PADDeadZones));
+  SDL_ReadIO(file, &controller->m_buttonMapping, sizeof(PADButtonMapping) * PAD_BUTTON_COUNT);
+  SDL_ReadIO(file, &controller->m_axisMapping, sizeof(PADAxisMapping) * PAD_AXIS_COUNT);
   if (!isGameCube) {
-    fread(&controller->m_rumbleIntensityLow, 1, sizeof(u16), file);
-    fread(&controller->m_rumbleIntensityHigh, 1, sizeof(u16), file);
+    SDL_ReadIO(file, &controller->m_rumbleIntensityLow, sizeof(u16));
+    SDL_ReadIO(file, &controller->m_rumbleIntensityHigh, sizeof(u16));
   }
-  fclose(file);
+  SDL_CloseIO(file);
+
+
+  bool axisCorrupt = false;
+  for (uint32_t i = 0; i < PAD_AXIS_COUNT; ++i) {
+    if (controller->m_axisMapping[i].padAxis != static_cast<PADAxis>(i)) {
+      axisCorrupt = true;
+      break;
+    }
+  }
+  if (axisCorrupt) {
+    aurora::input::Log.warn("__PADLoadMapping port={}: corrupt axis data in file, resetting axes to defaults", playerIndex);
+    controller->m_axisMapping = g_defaultAxes;
+  }
+
+
+  bool buttonCorrupt = false;
+  for (uint32_t i = 0; i < PAD_BUTTON_COUNT; ++i) {
+    if (controller->m_buttonMapping[i].padButton == 0) {
+      buttonCorrupt = true;
+      break;
+    }
+  }
+  if (buttonCorrupt) {
+    aurora::input::Log.warn("__PADLoadMapping port={}: corrupt button data in file, resetting buttons to defaults", playerIndex);
+    controller->m_buttonMapping = g_defaultButtons;
+  }
+
 }
 
 static void EnsureMappingLoaded(aurora::input::GameController* controller) {
@@ -335,6 +386,11 @@ static void apply_unblock_suppression(PADStatus& status, u32 port, bool captureH
 }
 
 uint32_t PADRead(PADStatus* status) {
+  if (!g_keyboardBindingsLoaded) {
+    g_keyboardBindingsLoaded = true;
+    load_keyboard_bindings();
+  }
+
   int numKeys = 0;
   const bool* kbState = SDL_GetKeyboardState(&numKeys);
   const bool captureHeldInput = g_suppressHeldOnRead && !g_blockPAD;
@@ -356,10 +412,65 @@ uint32_t PADRead(PADStatus* status) {
     if (g_keyboardBindings[i].m_mappingsSet) {
       std::for_each(g_keyboardBindings[i].m_buttonMapping.begin(), g_keyboardBindings[i].m_buttonMapping.end(),
                     [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
-                      if (mapping.scancode != PAD_KEY_INVALID && kbState[mapping.scancode]) {
+                      if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
+                        status[i].button |= mapping.padButton;
+                      } else if (is_mouse_scancode(mapping.scancode) && is_mouse_button_pressed(mapping.scancode)) {
                         status[i].button |= mapping.padButton;
                       }
                     });
+
+      int lx = 0, ly = 0, rx = 0, ry = 0, tl = 0, tr = 0;
+      for (const auto& binding : g_keyboardBindings[i].m_axisMapping) {
+        bool pressed = false;
+        if (binding.scancode > PAD_KEY_INVALID) {
+          pressed = binding.scancode < numKeys && kbState[binding.scancode];
+        } else if (is_mouse_scancode(binding.scancode)) {
+          pressed = is_mouse_button_pressed(binding.scancode);
+        }
+        if (!pressed) {
+          continue;
+        }
+        switch (binding.padAxis) {
+        case PAD_AXIS_LEFT_X_POS:
+          lx += 127;
+          break;
+        case PAD_AXIS_LEFT_X_NEG:
+          lx -= 127;
+          break;
+        case PAD_AXIS_LEFT_Y_POS:
+          ly += 127;
+          break;
+        case PAD_AXIS_LEFT_Y_NEG:
+          ly -= 127;
+          break;
+        case PAD_AXIS_RIGHT_X_POS:
+          rx += 127;
+          break;
+        case PAD_AXIS_RIGHT_X_NEG:
+          rx -= 127;
+          break;
+        case PAD_AXIS_RIGHT_Y_POS:
+          ry += 127;
+          break;
+        case PAD_AXIS_RIGHT_Y_NEG:
+          ry -= 127;
+          break;
+        case PAD_AXIS_TRIGGER_L:
+          tl += 255;
+          break;
+        case PAD_AXIS_TRIGGER_R:
+          tr += 255;
+          break;
+        default:
+          break;
+        }
+      }
+      status[i].stickX = static_cast<s8>(std::clamp((int)status[i].stickX + lx, -127, 127));
+      status[i].stickY = static_cast<s8>(std::clamp((int)status[i].stickY + ly, -127, 127));
+      status[i].substickX = static_cast<s8>(std::clamp((int)status[i].substickX + rx, -127, 127));
+      status[i].substickY = static_cast<s8>(std::clamp((int)status[i].substickY + ry, -127, 127));
+      status[i].triggerLeft = static_cast<u8>(std::min((int)status[i].triggerLeft + tl, 255));
+      status[i].triggerRight = static_cast<u8>(std::min((int)status[i].triggerRight + tr, 255));
     }
 
     if (controller) {
@@ -371,6 +482,33 @@ uint32_t PADRead(PADStatus* status) {
               status[i].button |= mapping.padButton;
             }
           });
+      
+      // TODO: Add serializable mappings for these (probably not necessary)?
+      static constexpr std::array<std::pair<SDL_GamepadButton, PADExtButton>, PAD_EXT_BUTTON_COUNT> kExtButtonMappings{
+          {
+            {SDL_GAMEPAD_BUTTON_BACK, PAD_BUTTON_BACK},
+            {SDL_GAMEPAD_BUTTON_GUIDE, PAD_BUTTON_GUIDE},
+            {SDL_GAMEPAD_BUTTON_MISC1, PAD_BUTTON_MISC1},
+            {SDL_GAMEPAD_BUTTON_MISC2, PAD_BUTTON_MISC2},
+            {SDL_GAMEPAD_BUTTON_MISC3, PAD_BUTTON_MISC3},
+            {SDL_GAMEPAD_BUTTON_MISC4, PAD_BUTTON_MISC4},
+            {SDL_GAMEPAD_BUTTON_MISC5, PAD_BUTTON_MISC5},
+            {SDL_GAMEPAD_BUTTON_MISC6, PAD_BUTTON_MISC6},
+            {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, PAD_BUTTON_RIGHT_PADDLE1},
+            {SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, PAD_BUTTON_LEFT_PADDLE1},
+            {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, PAD_BUTTON_RIGHT_PADDLE2},
+            {SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, PAD_BUTTON_LEFT_PADDLE2},
+            {SDL_GAMEPAD_BUTTON_RIGHT_STICK, PAD_BUTTON_RIGHT_STICK},
+            {SDL_GAMEPAD_BUTTON_LEFT_STICK, PAD_BUTTON_LEFT_STICK},
+            {SDL_GAMEPAD_BUTTON_TOUCHPAD, PAD_BUTTON_TOUCHPAD},
+          }
+      };
+      
+      for (const auto& mapping : kExtButtonMappings) {
+        if (SDL_GetGamepadButton(controller->m_controller, mapping.first)) {
+          status[i].extButton |= mapping.second;
+        }
+      }
 
       Sint16 xlPos = _get_axis_value(controller, PAD_AXIS_LEFT_X_POS);
       Sint16 xlNeg = _get_axis_value(controller, PAD_AXIS_LEFT_X_NEG);
@@ -429,6 +567,7 @@ uint32_t PADRead(PADStatus* status) {
 
       Sint16 tl = std::max((Sint16)0, _get_axis_value(controller, PAD_AXIS_TRIGGER_L));
       Sint16 tr = std::max((Sint16)0, _get_axis_value(controller, PAD_AXIS_TRIGGER_R));
+
       if (/*!controller->m_isGameCube && */ controller->m_deadZones.emulateTriggers) {
         if (tl > controller->m_deadZones.leftTriggerActivationZone) {
           status[i].button |= PAD_TRIGGER_L;
@@ -707,6 +846,7 @@ PADAxisMapping* PADGetAxisMappings(uint32_t port, uint32_t* axisCount) {
     return nullptr;
   }
 
+  EnsureMappingLoaded(controller);
   *axisCount = PAD_AXIS_COUNT;
   return controller->m_axisMapping.data();
 }
@@ -720,7 +860,6 @@ BOOL PADSetKeyButtonBinding(u32 port, PADKeyButtonBinding binding) {
   for (auto& b : state.m_buttonMapping) {
     if (b.padButton == binding.padButton) {
       b.scancode = binding.scancode;
-      state.m_mappingsSet = true;
       return TRUE;
     }
   }
@@ -754,7 +893,6 @@ BOOL PADSetKeyAxisBinding(u32 port, PADKeyAxisBinding binding) {
   for (auto& b : state.m_axisMapping) {
     if (b.padAxis == binding.padAxis) {
       b.scancode = binding.scancode;
-      state.m_mappingsSet = true;
       return TRUE;
     }
   }
@@ -778,6 +916,13 @@ PADKeyAxisBinding* PADGetKeyAxisBindings(u32 port, u32* axisCount) {
   return state.m_axisMapping.data();
 }
 
+void PADSetKeyboardActive(u32 port, BOOL active) {
+  if (port >= PAD_MAX_CONTROLLERS) {
+    return;
+  }
+  g_keyboardBindings[port].m_mappingsSet = active != FALSE;
+}
+
 void PADClearKeyBindings(u32 port) {
   if (port >= PAD_MAX_CONTROLLERS) {
     return;
@@ -787,8 +932,79 @@ void PADClearKeyBindings(u32 port) {
   g_keyboardBindings[port].m_mappingsSet = false;
 }
 
-void __PADWriteDeadZones(FILE* file, aurora::input::GameController& controller) {
-  fwrite(&controller.m_deadZones, 1, sizeof(PADDeadZones), file);
+constexpr uint32_t k_keyboardMagic = SBIG('KBND');
+constexpr int32_t k_keyboardVersion = 2;
+
+static void load_keyboard_bindings() {
+  std::filesystem::path filePath = std::filesystem::path{aurora::g_config.configPath} / "keyboard_bindings.dat";
+  SDL_IOStream* file = SDL_IOFromFile(filePath.string().c_str(), "rb");
+  if (file == nullptr) {
+    return;
+  }
+
+  uint32_t magic = 0;
+  SDL_ReadU32LE(file, &magic);
+  if (magic != k_keyboardMagic) {
+    aurora::input::Log.warn("keyboard_bindings.dat: invalid magic");
+    SDL_CloseIO(file);
+    return;
+  }
+
+  uint32_t version = 0;
+  SDL_ReadU32LE(file, &version);
+  if (version != k_keyboardVersion) {
+    aurora::input::Log.warn("keyboard_bindings.dat: version mismatch (expected {}, got {})", k_keyboardVersion,
+                            version);
+    SDL_CloseIO(file);
+    return;
+  }
+
+  int64_t dataStart = (SDL_TellIO(file) + 31) & ~31;
+  SDL_SeekIO(file, dataStart, SDL_IO_SEEK_SET);
+
+  for (uint32_t port = 0; port < g_keyboardBindings.size(); ++port) {
+    auto& state = g_keyboardBindings[port];
+    SDL_ReadIO(file, &state.m_mappingsSet, sizeof(bool));
+    SDL_ReadIO(file, state.m_buttonMapping.data(), sizeof(PADKeyButtonBinding) * PAD_BUTTON_COUNT);
+    SDL_ReadIO(file, state.m_axisMapping.data(), sizeof(PADKeyAxisBinding) * PAD_AXIS_COUNT);
+
+    if (state.m_mappingsSet) {
+      const bool anyBound = std::any_of(state.m_buttonMapping.begin(), state.m_buttonMapping.end(),
+                                        [](const PADKeyButtonBinding& b) { return b.scancode != PAD_KEY_INVALID; }) ||
+                            std::any_of(state.m_axisMapping.begin(), state.m_axisMapping.end(),
+                                        [](const PADKeyAxisBinding& b) { return b.scancode != PAD_KEY_INVALID; });
+      if (!anyBound) {
+        state.m_mappingsSet = false;
+      }
+    }
+  }
+  SDL_CloseIO(file);
+}
+
+static void save_keyboard_bindings() {
+  std::filesystem::path filePath = std::filesystem::path{aurora::g_config.configPath} / "keyboard_bindings.dat";
+  SDL_IOStream* file = SDL_IOFromFile(filePath.string().c_str(), "wb");
+  if (file == nullptr) {
+    aurora::input::Log.warn("save_keyboard_bindings: failed to open {} for writing", filePath.string());
+    return;
+  }
+
+  SDL_WriteU32LE(file, k_keyboardMagic);
+  SDL_WriteS32LE(file, k_keyboardVersion);
+
+  int64_t dataStart = (SDL_TellIO(file) + 31) & ~31;
+  SDL_SeekIO(file, dataStart, SDL_IO_SEEK_SET);
+
+  for (const auto& state : g_keyboardBindings) {
+    SDL_WriteU8(file, state.m_mappingsSet);
+    SDL_WriteIO(file, state.m_buttonMapping.data(), sizeof(PADKeyButtonBinding) * PAD_BUTTON_COUNT);
+    SDL_WriteIO(file, state.m_axisMapping.data(), sizeof(PADKeyAxisBinding) * PAD_AXIS_COUNT);
+  }
+  SDL_CloseIO(file);
+}
+
+void __PADWriteDeadZones(SDL_IOStream* file, aurora::input::GameController& controller) {
+  SDL_WriteIO(file, &controller.m_deadZones, sizeof(PADDeadZones));
 }
 
 void PADSerializeMappings() {
@@ -803,21 +1019,21 @@ void PADSerializeMappings() {
 
     // don't truncate the file if it already exists
     const char* openMode = std::filesystem::exists(filePath) ? "r+b" : "wb";
-    FILE* file = fopen(filePathStr.c_str(), openMode);
+    SDL_IOStream* file = SDL_IOFromFile(filePathStr.c_str(), openMode);
     if (file == nullptr) {
       return;
     }
-    fseek(file, 0, SEEK_SET);
+    SDL_SeekIO(file, 0, SDL_IO_SEEK_SET);
 
     // write header
     uint32_t magic = SBIG('CTRL');
-    fwrite(&magic, 1, sizeof(magic), file);
-    fwrite(&k_mappingsFileVersion, 1, sizeof(k_mappingsFileVersion), file);
-    fwrite(&controller.second.m_isGameCube, 1, 1, file);
+    SDL_WriteU32LE(file, magic);
+    SDL_WriteU32LE(file, k_mappingsFileVersion);
+    SDL_WriteU8(file, controller.second.m_isGameCube);
 
     // start writing data at next 32-byte aligned offset
-    int32_t dataStart = (ftell(file) + 31) & ~31;
-    fseek(file, dataStart, SEEK_SET);
+    int64_t dataStart = (SDL_TellIO(file) + 31) & ~31;
+    SDL_SeekIO(file, dataStart, SDL_IO_SEEK_SET);
     if (controller.second.m_isGameCube) {
       // GameCube adapters expose 4 input devices with the same vid/pid, we store all 4 in the same file
       uint32_t port = aurora::input::player_index(controller.second.m_index);
@@ -825,18 +1041,20 @@ void PADSerializeMappings() {
       uint32_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
       uint32_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
       // skip to offset in file for this particular port
-      fseek(file, dataStart + ((dzSecLen + btnSecLen + axisSecLen) * port), SEEK_SET);
+      SDL_SeekIO(file, dataStart + ((dzSecLen + btnSecLen + axisSecLen) * port), SDL_IO_SEEK_SET);
     }
     __PADWriteDeadZones(file, controller.second);
-    fwrite(controller.second.m_buttonMapping.data(), 1, sizeof(PADButtonMapping) * PAD_BUTTON_COUNT, file);
-    fwrite(controller.second.m_axisMapping.data(), 1, sizeof(PADAxisMapping) * PAD_AXIS_COUNT, file);
+    SDL_WriteIO(file, controller.second.m_buttonMapping.data(), sizeof(PADButtonMapping) * PAD_BUTTON_COUNT);
+    SDL_WriteIO(file, controller.second.m_axisMapping.data(), sizeof(PADAxisMapping) * PAD_AXIS_COUNT);
 
     if (!controller.second.m_isGameCube) {
-      fwrite(&controller.second.m_rumbleIntensityLow, 1, sizeof(u16), file);
-      fwrite(&controller.second.m_rumbleIntensityHigh, 1, sizeof(u16), file);
+      SDL_WriteIO(file, &controller.second.m_rumbleIntensityLow,  sizeof(u16));
+      SDL_WriteIO(file, &controller.second.m_rumbleIntensityHigh,sizeof(u16));
     }
-    fclose(file);
+    SDL_CloseIO(file);
   }
+
+  save_keyboard_bindings();
 }
 
 PADDeadZones* PADGetDeadZones(uint32_t port) {
@@ -952,12 +1170,12 @@ PADSignedNativeAxis PADGetNativeAxisPulled(uint32_t port) {
   for (int32_t i = 0; i < SDL_GAMEPAD_AXIS_COUNT; ++i) {
     auto axisVal = SDL_GetGamepadAxis(controller->m_controller, static_cast<SDL_GamepadAxis>(i));
     if (axisVal >= 16384) {
-      if (i == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || i == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
-        return {i, AXIS_SIGN_POSITIVE};
-      } else {
-        return {i, AXIS_SIGN_POSITIVE};
-      }
+      return {i, AXIS_SIGN_POSITIVE};
     } else if (axisVal <= -16384) {
+      // SDL3 triggers rest at -32768, so skip their negative direction.
+      if (i == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || i == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+        continue;
+      }
       return {i, AXIS_SIGN_NEGATIVE};
     }
   }
@@ -1092,4 +1310,20 @@ BOOL PADIsGCAdapter(u32 port) {
     return FALSE;
   }
   return ctrl->m_isGameCube;
+}
+
+PADBatteryState PADGetBatteryState(u32 port, f32* perc) {
+  const auto* ctrl = aurora::input::get_controller_for_player(port);
+  if (ctrl == nullptr) {
+    return PAD_BATTERYSTATE_ERROR;
+  }
+  
+  int tmp = 0;
+  const auto ret = SDL_GetGamepadPowerInfo(ctrl->m_controller, &tmp);
+  if (tmp != -1) {
+    *perc = static_cast<float>(tmp) / 100.f;
+  } else {
+    *perc = static_cast<float>(tmp);
+  }
+  return static_cast<PADBatteryState>(ret);
 }
